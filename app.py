@@ -5,21 +5,24 @@ load_dotenv()
 import streamlit as st
 import os
 import tempfile
+import time
 
 from langchain_community.document_loaders import PyPDFLoader #for pdf loading
-from langchain_text_splitters import RecursiveCharacterTextSplitter #for splitting text
-from langchain_huggingface import HuggingFaceEmbeddings #for local embeddings
 from langchain_google_genai import ChatGoogleGenerativeAI #for generating answers
-from langchain_community.vectorstores import InMemoryVectorStore #for vector database
 
 
 #chat model
-llm = ChatGoogleGenerativeAI(model="gemini-3.8-flash")
+@st.cache_resource
+def load_model():
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0,
+        max_output_tokens=300,
+        timeout=30
+    )
 
-#embedding model
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+
+llm = load_model()
 
 
 #function to process the uploaded PDF
@@ -29,52 +32,43 @@ def document_process(path):
     loader = PyPDFLoader(path)
     docs = loader.load()
 
-    #splitting text into chunks
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-    docs = splitter.split_documents(docs)
-
-    #creating vector database
-    vector_db = InMemoryVectorStore.from_documents(
-        documents=docs,
-        embedding=embeddings
+    #extracting text from the document
+    document_text = "\n\n".join(
+        doc.page_content for doc in docs
     )
 
-    return vector_db
+    return document_text
 
 
 #function to answer user's question
-def get_answer(query, vector_db):
+def get_answer(query, document_text):
 
-    #searching for relevant text
-    documents = vector_db.similarity_search(query, k=5)
-
-    #joining the text
-    context = "\n\n".join(
-        doc.page_content for doc in documents
-    )
-
-    #sending question and document text to Gemini
     prompt = f"""
-    Answer the question using the given document text.
-    If the answer is not available, say so.
-    Do not make up information.
+Answer the question using only the given document text.
+If the answer is not available, say so.
+Do not make up information.
+Keep the answer clear and concise.
 
-    Document:
-    {context}
+Document:
+{document_text}
 
-    Question: {query}
-    """
+Question: {query}
 
+Answer:
+"""
+
+    # Generate the answer using Gemini
+    start = time.perf_counter()
     response = llm.invoke(prompt)
-    return response.text
+    answer_time = time.perf_counter() - start
+
+    return response.content, answer_time
 
 
 #chatbot interface
 st.title("Document Q&A Chatbot")
 st.write("Upload a PDF and ask questions about it.")
+
 
 #checking whether a document is uploaded
 if "uploaded" not in st.session_state:
@@ -82,6 +76,12 @@ if "uploaded" not in st.session_state:
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+if "document_text" not in st.session_state:
+    st.session_state.document_text = ""
+
+if "timings" not in st.session_state:
+    st.session_state.timings = {}
 
 
 #first screen: upload PDF
@@ -100,12 +100,25 @@ if not st.session_state.uploaded:
                 path = temp_file.name
 
             try:
-                st.session_state.vector_db = document_process(path)
-                st.session_state.uploaded = True
-            finally:
-                os.remove(path)
+                st.session_state.document_text = document_process(path)
 
-        st.rerun()
+                if not st.session_state.document_text.strip():
+                    st.error(
+                        "No readable text was found in this PDF. "
+                        "Please upload a text-based PDF."
+                    )
+                else:
+                    st.session_state.uploaded = True
+
+            except Exception as e:
+                st.error(f"Could not read the PDF: {e}")
+
+            finally:
+                if os.path.exists(path):
+                    os.remove(path)
+
+        if st.session_state.uploaded:
+            st.rerun()
 
 
 #second screen: ask questions
@@ -118,30 +131,56 @@ else:
         with st.chat_message(message["role"]):
             st.write(message["content"])
 
+            if message["role"] == "assistant":
+                timing = st.session_state.timings.get(
+                    message.get("question", "")
+                )
+
+                if timing is not None:
+                    st.caption(
+                        f"Gemini response: {timing:.2f} seconds"
+                    )
+
     query = st.chat_input("Ask a question about your PDF")
 
     if query:
 
         #getting the answer
-        with st.spinner("Finding the answer..."):
-            answer = get_answer(
-                query,
-                st.session_state.vector_db
-            )
-
-        #saving the conversation
         st.session_state.messages.append(
             {"role": "user", "content": query}
         )
+
+        with st.spinner("Finding the answer..."):
+            try:
+                answer, answer_time = get_answer(
+                    query,
+                    st.session_state.document_text
+                )
+
+                st.session_state.timings[query] = answer_time
+
+            except Exception as e:
+                answer = (
+                    "Sorry, I could not generate an answer. "
+                    f"Please try again. Error: {e}"
+                )
+
+        #saving the conversation
         st.session_state.messages.append(
-            {"role": "assistant", "content": answer}
+            {
+                "role": "assistant",
+                "content": answer,
+                "question": query
+            }
         )
 
         st.rerun()
+
 
     #upload a different PDF
     if st.button("Upload another document"):
         st.session_state.uploaded = False
         st.session_state.messages = []
-        st.session_state.vector_db = None
+        st.session_state.document_text = ""
+        st.session_state.timings = {}
         st.rerun()
