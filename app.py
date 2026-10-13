@@ -11,16 +11,16 @@ from langchain_community.document_loaders import PyPDFLoader #for pdf loading
 from langchain_google_genai import ChatGoogleGenerativeAI #for generating answers
 
 
+
 #chat model
 @st.cache_resource
 def load_model():
     return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         temperature=0,
         max_output_tokens=300,
-        timeout=30
+        timeout=60
     )
-
 
 llm = load_model()
 
