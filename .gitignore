@@ -1,0 +1,14 @@
+# Python environment
+env/
+.venv/
+__pycache__/
+*.pyc
+
+# API keys and secrets
+.env
+
+# Temporary uploaded documents
+uploaded_document.pdf
+
+# Mac files
+.DS_Store
