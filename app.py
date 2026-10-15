@@ -6,43 +6,126 @@ import os
 import tempfile
 import time
 
+import faiss
+import numpy as np
 import streamlit as st
+
+from sentence_transformers import SentenceTransformer
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
-# API key configuration
+# 1. API KEY CONFIGURATION
+
+
 try:
-    if not os.getenv("GOOGLE_API_KEY") and "GOOGLE_API_KEY" in st.secrets:
+    if not os.getenv("GOOGLE_API_KEY"):
         os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
 except Exception:
     pass
 
 
-# Load the Gemini model
+
+# 2. LOAD MODELS
+
+
 @st.cache_resource
-def load_model():
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+@st.cache_resource
+def load_chat_model():
     return ChatGoogleGenerativeAI(
         model="gemini-3.5-flash-lite",
-        temperature=0,
-        max_output_tokens=1000,
+        max_output_tokens=500,
         timeout=60
     )
 
+# 3. LOAD AND SPLIT PDF
 
-# Process the uploaded PDF
-def document_process(path):
+
+def process_pdf(path):
     loader = PyPDFLoader(path)
-    docs = loader.load()
+    pages = loader.load()
 
-    document_text = "\n\n".join(
-        doc.page_content for doc in docs
-    ).strip()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
 
-    return document_text
+    chunks = splitter.split_documents(pages)
+
+    # Remove empty chunks
+    chunks = [
+        chunk for chunk in chunks
+        if chunk.page_content.strip()
+    ]
+
+    return chunks
 
 
-# Format Gemini's response as readable text
+
+# 4. CREATE FAISS VECTOR INDEX
+
+
+def create_vector_index(chunks):
+    embedding_model = load_embedding_model()
+
+    texts = [chunk.page_content for chunk in chunks]
+
+    embeddings = embedding_model.encode(
+        texts,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False
+    ).astype("float32")
+
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+
+    return index
+
+
+# 5. RETRIEVE RELEVANT CHUNKS
+
+def retrieve_chunks(question, chunks, index, top_k=4):
+    embedding_model = load_embedding_model()
+
+    question_embedding = embedding_model.encode(
+        [question],
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    ).astype("float32")
+
+    k = min(top_k, index.ntotal)
+
+    scores, indices = index.search(
+        question_embedding,
+        k
+    )
+
+    results = []
+
+    for position, chunk_index in enumerate(indices[0]):
+        if chunk_index < 0:
+            continue
+
+        chunk = chunks[int(chunk_index)]
+
+        results.append({
+            "text": chunk.page_content,
+            "page": chunk.metadata.get("page", 0) + 1,
+            "score": float(scores[0][position])
+        })
+
+    return results
+
+
+# 6. FORMAT GEMINI RESPONSE
+
+
 def format_answer(content):
     if isinstance(content, str):
         return content.strip()
@@ -71,190 +154,210 @@ def format_answer(content):
     return ""
 
 
-# Answer the user's question
-def get_answer(query, document_text):
-    query = query.strip()
+# 7. GENERATE ANSWER USING RETRIEVED CONTEXT
 
-    if not query:
-        return "Please enter a question about your document.", 0.0
+def get_answer(question, chunks, index):
+    question = question.strip()
 
-    if not document_text.strip():
-        return "No readable text was extracted from this PDF.", 0.0
+    if not question:
+        return "Please enter a question.", 0.0, []
 
-    # Send only the first 10,000 characters to Gemini
-    max_chars = 10000
-    relevant_text = document_text[:max_chars]
+    start = time.perf_counter()
 
-    if len(document_text) > max_chars:
-        relevant_text += (
-            "\n\nNote: Only the beginning of the document was included. "
-            "Information from later sections may be missing."
-        )
+    # Retrieve relevant sections from the PDF
+    results = retrieve_chunks(
+        question,
+        chunks,
+        index,
+        top_k=4
+    )
+
+    if not results:
+        return "No relevant document sections were found.", 0.0, []
+
+    context = "\n\n---\n\n".join(
+        f"[PDF page {result['page']}]\n{result['text']}"
+        for result in results
+    )
 
     prompt = f"""
-You are a helpful document question-answering assistant.
+You are a helpful PDF question-answering assistant.
 
-Answer the user's question using the supplied document text.
+Answer the question using only the retrieved document sections.
 
 Instructions:
-- Use clear, simple, natural language.
-- Keep normal answers under 120 words.
+- Use simple, clear language.
+- Keep normal answers concise, usually under 120 words.
 - Answer directly without unnecessary introductions.
-- Do not repeat the question.
-- For a summary requested in 10 lines, provide 10 numbered lines.
-- For key takeaways, use a numbered list.
-- If the answer is not present in the supplied text, say so.
-- Never invent facts.
+- Do not invent facts.
+- If the supplied sections do not contain the answer,
+  say that you could not find the answer in the retrieved sections.
+- Cite supporting page numbers, such as (Page 54).
 - Return plain, readable text only.
-- Do not return JSON, SVG, signatures, or metadata.
 
-DOCUMENT:
-{relevant_text}
+RETRIEVED DOCUMENT SECTIONS:
+{context}
 
 USER QUESTION:
-{query}
+{question}
 
 ANSWER:
 """
 
-    # Retry temporary service-unavailable errors
-    for attempt in range(3):
-        try:
-            start = time.perf_counter()
-            response = llm.invoke(prompt)
-            answer_time = time.perf_counter() - start
+    try:
+        llm = load_chat_model()
+        response = llm.invoke(prompt)
+        answer = format_answer(response.content)
 
-            answer = format_answer(response.content)
+        if not answer:
+            answer = "Gemini returned no readable answer. Please try again."
 
-            if not answer:
-                answer = (
-                    "Gemini returned an empty text response. "
-                    "Please try asking the question again."
-                )
+        elapsed = time.perf_counter() - start
 
-            return answer, answer_time
+        source_pages = sorted({
+            result["page"] for result in results
+        })
 
-        except Exception as e:
-            error_message = str(e).upper()
+        return answer, elapsed, source_pages
 
-            if (
-                ("503" in error_message or "UNAVAILABLE" in error_message)
-                and attempt < 2
-            ):
-                time.sleep(2 ** (attempt + 1))
-                continue
-
-            raise
+    except Exception:
+        raise
 
 
-# Initialize Gemini
-try:
-    llm = load_model()
-except Exception:
-    st.error(
-        "Could not initialize Gemini. Check your API key, "
-        "model availability, and Streamlit Cloud Secrets."
-    )
-    st.stop()
+# 8. STREAMLIT INTERFACE
 
 
-# Chatbot interface
+st.set_page_config(
+    page_title="Document Q&A Chatbot",
+    page_icon="📄"
+)
+
 st.title("Document Q&A Chatbot")
-st.write("Upload a PDF and ask questions about it.")
+st.write(
+    "Upload a PDF and ask questions. "
+    "RAG retrieves relevant sections to help answer your questions."
+)
 
 
 # Initialize session state
-if "uploaded" not in st.session_state:
-    st.session_state.uploaded = False
+defaults = {
+    "uploaded": False,
+    "messages": [],
+    "chunks": [],
+    "vector_index": None,
+    "document_name": "",
+    "timings": {}
+}
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "document_text" not in st.session_state:
-    st.session_state.document_text = ""
-
-if "timings" not in st.session_state:
-    st.session_state.timings = {}
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
-# Screen 1: Upload a PDF
+# 9. UPLOAD AND PROCESS DOCUMENT
+
+
 if not st.session_state.uploaded:
-    file = st.file_uploader("Choose your PDF", type="pdf")
+    uploaded_file = st.file_uploader(
+        "Choose your PDF",
+        type=["pdf"]
+    )
 
-    if file is not None:
-        with st.spinner("Reading your document..."):
-            path = None
+    if uploaded_file is not None:
+        path = None
 
-            try:
-                # Save the PDF temporarily
+        try:
+            with st.spinner(
+                "Extracting text, creating chunks and building the search index..."
+            ):
                 with tempfile.NamedTemporaryFile(
                     delete=False,
                     suffix=".pdf"
                 ) as temp_file:
-                    temp_file.write(file.getvalue())
+                    temp_file.write(uploaded_file.getvalue())
                     path = temp_file.name
 
-                # Extract the PDF text once
-                extracted_text = document_process(path)
+                chunks = process_pdf(path)
 
-                if not extracted_text:
+                if not chunks:
                     st.error(
                         "No readable text was found in this PDF. "
-                        "It may be scanned or image-based. "
-                        "Please use a text-based PDF or add OCR support."
+                        "Please try a text-based PDF."
                     )
                 else:
-                    st.session_state.document_text = extracted_text
+                    vector_index = create_vector_index(chunks)
+
+                    st.session_state.chunks = chunks
+                    st.session_state.vector_index = vector_index
+                    st.session_state.document_name = uploaded_file.name
+                    st.session_state.messages = []
+                    st.session_state.timings = {}
                     st.session_state.uploaded = True
 
-            except Exception as e:
-                st.error(f"Could not read the PDF: {e}")
+        except Exception as e:
+            st.error(f"Could not process the PDF: {e}")
 
-            finally:
-                if path and os.path.exists(path):
-                    os.remove(path)
+        finally:
+            if path and os.path.exists(path):
+                os.remove(path)
 
         if st.session_state.uploaded:
             st.rerun()
 
 
-# Screen 2: Ask questions
-else:
-    st.success("Your document is ready!")
 
-    # Display previous questions and answers
+# 10. CHAT WITH THE DOCUMENT
+
+else:
+    st.success(
+        f"Document ready: {st.session_state.document_name}"
+    )
+
+    st.caption(
+        f"Indexed {len(st.session_state.chunks)} text chunks for retrieval."
+    )
+
+    # Display previous messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
 
             if message["role"] == "assistant":
-                timing = st.session_state.timings.get(
-                    message.get("question", "")
-                )
+                question = message.get("question", "")
+                timing = st.session_state.timings.get(question)
 
                 if timing is not None:
-                    st.caption(
-                        f"Gemini response: {timing:.2f} seconds"
+                    st.caption(f"Response time: {timing:.2f} seconds")
+
+                pages = message.get("sources", [])
+
+                if pages:
+                    page_text = ", ".join(
+                        str(page) for page in pages
                     )
+                    st.caption(f"Retrieved source pages: {page_text}")
 
-    query = st.chat_input("Ask a question about your PDF")
+    question = st.chat_input(
+        "Ask a question about your PDF"
+    )
 
-    if query and query.strip():
-        query = query.strip()
+    if question and question.strip():
+        question = question.strip()
 
-        # Save the question
-        st.session_state.messages.append(
-            {"role": "user", "content": query}
-        )
+        st.session_state.messages.append({
+            "role": "user",
+            "content": question
+        })
 
-        with st.spinner("Finding the answer..."):
+        with st.spinner("Searching the document and generating an answer..."):
             try:
-                answer, answer_time = get_answer(
-                    query,
-                    st.session_state.document_text
+                answer, elapsed, sources = get_answer(
+                    question,
+                    st.session_state.chunks,
+                    st.session_state.vector_index
                 )
 
-                st.session_state.timings[query] = answer_time
+                st.session_state.timings[question] = elapsed
 
             except Exception as e:
                 error_message = str(e).upper()
@@ -265,7 +368,7 @@ else:
                 ):
                     answer = (
                         "Your Gemini API quota has been reached. "
-                        "Please wait for it to reset or check your usage at "
+                        "Please wait for it to reset or check "
                         "https://ai.dev/rate-limit"
                     )
 
@@ -275,7 +378,7 @@ else:
                 ):
                     answer = (
                         "Gemini is temporarily unavailable. "
-                        "Please wait a little and try again."
+                        "Please try again later."
                     )
 
                 else:
@@ -284,22 +387,25 @@ else:
                         f"Error: {e}"
                     )
 
-        # Save the answer
-        st.session_state.messages.append(
-            {
+                elapsed = None
+                sources = []
+
+            st.session_state.messages.append({
                 "role": "assistant",
                 "content": answer,
-                "question": query
-            }
-        )
+                "question": question,
+                "sources": sources
+            })
 
         st.rerun()
 
-    # Upload a different PDF
+    # Start with another PDF
     if st.button("Upload another document"):
         st.session_state.uploaded = False
         st.session_state.messages = []
-        st.session_state.document_text = ""
+        st.session_state.chunks = []
+        st.session_state.vector_index = None
+        st.session_state.document_name = ""
         st.session_state.timings = {}
 
         st.rerun()
