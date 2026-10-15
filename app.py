@@ -19,25 +19,22 @@ except Exception:
     pass
 
 
-# chat model
+# Load the Gemini model
 @st.cache_resource
 def load_model():
     return ChatGoogleGenerativeAI(
-        model="gemini-3.8-flash",
+        model="gemini-2.5-flash-lite",
         temperature=0,
         max_output_tokens=1000,
         timeout=60
     )
 
 
-# function to process the uploaded PDF
+# Process the uploaded PDF
 def document_process(path):
-
-    # loading the document
     loader = PyPDFLoader(path)
     docs = loader.load()
 
-    # extracting text from the document
     document_text = "\n\n".join(
         doc.page_content for doc in docs
     ).strip()
@@ -45,9 +42,8 @@ def document_process(path):
     return document_text
 
 
-# function to format the model response as readable text
+# Format Gemini's response as readable text
 def format_answer(content):
-
     if isinstance(content, str):
         return content.strip()
 
@@ -60,6 +56,7 @@ def format_answer(content):
 
             elif isinstance(item, dict):
                 text_value = item.get("text")
+
                 if isinstance(text_value, str) and text_value.strip():
                     parts.append(text_value.strip())
 
@@ -67,15 +64,15 @@ def format_answer(content):
 
     if isinstance(content, dict):
         text_value = content.get("text")
+
         if isinstance(text_value, str):
             return text_value.strip()
 
     return ""
 
 
-# function to answer user's question
+# Answer the user's question
 def get_answer(query, document_text):
-
     query = query.strip()
 
     if not query:
@@ -84,29 +81,32 @@ def get_answer(query, document_text):
     if not document_text.strip():
         return "No readable text was extracted from this PDF.", 0.0
 
-    # Keep the request within a reasonable size
-    max_chars = 40000
+    # Send only the first 10,000 characters to Gemini
+    max_chars = 10000
     relevant_text = document_text[:max_chars]
 
     if len(document_text) > max_chars:
         relevant_text += (
-            "\n\nOnly the beginning of the document is included. "
-            "The answer may not cover information outside this section."
+            "\n\nNote: Only the beginning of the document was included. "
+            "Information from later sections may be missing."
         )
 
     prompt = f"""
 You are a helpful document question-answering assistant.
 
-Answer the user's question using the provided document text.
+Answer the user's question using the supplied document text.
 
 Instructions:
-- Use clear, natural, human-readable language.
-- Never return a dictionary, JSON, SVG, signature, or metadata.
+- Use clear, simple, natural language.
+- Keep normal answers under 120 words.
+- Answer directly without unnecessary introductions.
+- Do not repeat the question.
 - For a summary requested in 10 lines, provide 10 numbered lines.
-- For key takeaways, provide a numbered list.
-- Answer questions directly and avoid unnecessary introductions.
+- For key takeaways, use a numbered list.
 - If the answer is not present in the supplied text, say so.
-- Do not invent facts or pretend to have read text that was not provided.
+- Never invent facts.
+- Return plain, readable text only.
+- Do not return JSON, SVG, signatures, or metadata.
 
 DOCUMENT:
 {relevant_text}
@@ -117,7 +117,7 @@ USER QUESTION:
 ANSWER:
 """
 
-    # Generate the answer using Gemini
+    # Retry temporary service-unavailable errors
     for attempt in range(3):
         try:
             start = time.perf_counter()
@@ -137,7 +137,6 @@ ANSWER:
         except Exception as e:
             error_message = str(e).upper()
 
-            # Retry temporary service-unavailable errors
             if (
                 ("503" in error_message or "UNAVAILABLE" in error_message)
                 and attempt < 2
@@ -148,7 +147,7 @@ ANSWER:
             raise
 
 
-# load the chat model
+# Initialize Gemini
 try:
     llm = load_model()
 except Exception:
@@ -159,12 +158,12 @@ except Exception:
     st.stop()
 
 
-# chatbot interface
+# Chatbot interface
 st.title("Document Q&A Chatbot")
 st.write("Upload a PDF and ask questions about it.")
 
 
-# checking whether a document is uploaded
+# Initialize session state
 if "uploaded" not in st.session_state:
     st.session_state.uploaded = False
 
@@ -178,19 +177,16 @@ if "timings" not in st.session_state:
     st.session_state.timings = {}
 
 
-# first screen: upload PDF
+# Screen 1: Upload a PDF
 if not st.session_state.uploaded:
-
     file = st.file_uploader("Choose your PDF", type="pdf")
 
     if file is not None:
-
         with st.spinner("Reading your document..."):
-
             path = None
 
             try:
-                # saving PDF temporarily
+                # Save the PDF temporarily
                 with tempfile.NamedTemporaryFile(
                     delete=False,
                     suffix=".pdf"
@@ -198,7 +194,7 @@ if not st.session_state.uploaded:
                     temp_file.write(file.getvalue())
                     path = temp_file.name
 
-                # processing the uploaded PDF
+                # Extract the PDF text once
                 extracted_text = document_process(path)
 
                 if not extracted_text:
@@ -222,14 +218,12 @@ if not st.session_state.uploaded:
             st.rerun()
 
 
-# second screen: ask questions
+# Screen 2: Ask questions
 else:
-
     st.success("Your document is ready!")
 
-    # showing previous questions and answers
+    # Display previous questions and answers
     for message in st.session_state.messages:
-
         with st.chat_message(message["role"]):
             st.write(message["content"])
 
@@ -246,16 +240,14 @@ else:
     query = st.chat_input("Ask a question about your PDF")
 
     if query and query.strip():
-
         query = query.strip()
 
-        # saving the question
+        # Save the question
         st.session_state.messages.append(
             {"role": "user", "content": query}
         )
 
         with st.spinner("Finding the answer..."):
-
             try:
                 answer, answer_time = get_answer(
                     query,
@@ -267,14 +259,20 @@ else:
             except Exception as e:
                 error_message = str(e).upper()
 
-                if "429" in error_message or "RESOURCE_EXHAUSTED" in error_message:
+                if (
+                    "429" in error_message
+                    or "RESOURCE_EXHAUSTED" in error_message
+                ):
                     answer = (
                         "Your Gemini API quota has been reached. "
-                        "Wait until it resets or check your usage at "
+                        "Please wait for it to reset or check your usage at "
                         "https://ai.dev/rate-limit"
                     )
 
-                elif "503" in error_message or "UNAVAILABLE" in error_message:
+                elif (
+                    "503" in error_message
+                    or "UNAVAILABLE" in error_message
+                ):
                     answer = (
                         "Gemini is temporarily unavailable. "
                         "Please wait a little and try again."
@@ -286,7 +284,7 @@ else:
                         f"Error: {e}"
                     )
 
-        # saving the conversation
+        # Save the answer
         st.session_state.messages.append(
             {
                 "role": "assistant",
@@ -297,10 +295,8 @@ else:
 
         st.rerun()
 
-
-    # upload a different PDF
+    # Upload a different PDF
     if st.button("Upload another document"):
-
         st.session_state.uploaded = False
         st.session_state.messages = []
         st.session_state.document_text = ""
