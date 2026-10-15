@@ -23,7 +23,7 @@ except Exception:
 @st.cache_resource
 def load_model():
     return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-lite",
+        model="gemini-3.5-flash-lite",
         temperature=0,
         max_output_tokens=1000,
         timeout=60
