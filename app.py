@@ -2,17 +2,27 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import streamlit as st
 import os
 import tempfile
 import time
 
-from langchain_community.document_loaders import PyPDFLoader #for pdf loading
-from langchain_google_genai import ChatGoogleGenerativeAI #for generating answers
+import streamlit as st
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 
+# API key configuration
+try:
+    if (
+        not os.getenv("GOOGLE_API_KEY")
+        and "GOOGLE_API_KEY" in st.secrets
+    ):
+        os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
+except Exception:
+    pass
 
-#chat model
+
+# chat model
 @st.cache_resource
 def load_model():
     return ChatGoogleGenerativeAI(
@@ -22,17 +32,15 @@ def load_model():
         timeout=60
     )
 
-llm = load_model()
 
-
-#function to process the uploaded PDF
+# function to process the uploaded PDF
 def document_process(path):
 
-    #loading the document
+    # loading the document
     loader = PyPDFLoader(path)
     docs = loader.load()
 
-    #extracting text from the document
+    # extracting text from the document
     document_text = "\n\n".join(
         doc.page_content for doc in docs
     )
@@ -40,37 +48,125 @@ def document_process(path):
     return document_text
 
 
-#function to answer user's question
+# function to convert model output into readable text
+def format_answer(content):
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+
+            elif isinstance(item, dict):
+                # Extract text instead of showing the entire dictionary
+                text_value = item.get("text")
+
+                if isinstance(text_value, str):
+                    parts.append(text_value)
+
+                elif item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+
+            # Ignore non-text content such as signatures and SVG metadata
+
+        return "\n".join(part for part in parts if part).strip()
+
+    if isinstance(content, dict):
+        text_value = content.get("text")
+
+        if isinstance(text_value, str):
+            return text_value.strip()
+
+        return "The model returned structured data instead of a text answer."
+
+    return str(content).strip()
+
+
+# function to answer user's question
 def get_answer(query, document_text):
 
+    # Keep the request within a reasonable size
+    max_chars = 40000
+    relevant_text = document_text[:max_chars]
+
+    if len(document_text) > max_chars:
+        relevant_text += (
+            "\n\nOnly the beginning of the document is included. "
+            "If the answer is not present here, say that it was not found."
+        )
+
     prompt = f"""
-Answer the question using only the given document text.
-If the answer is not available, say so.
-Do not make up information.
-Keep the answer clear and concise.
+You are a helpful document question-answering assistant.
 
-Document:
-{document_text}
+Answer the user's question using only the document text below.
 
-Question: {query}
+Important rules:
+- Reply in normal, natural human language.
+- Do not return a Python dictionary, JSON, XML, SVG, signatures,
+  metadata, or other structured output.
+- If the question asks for a name, give the name directly.
+- If the answer is not present in the document, say so clearly.
+- Do not invent information.
+- Keep the answer concise and easy to understand.
 
-Answer:
+Document text:
+{relevant_text}
+
+User's question:
+{query}
+
+Your plain-language answer:
 """
 
     # Generate the answer using Gemini
-    start = time.perf_counter()
-    response = llm.invoke(prompt)
-    answer_time = time.perf_counter() - start
+    for attempt in range(3):
+        try:
+            start = time.perf_counter()
+            response = llm.invoke(prompt)
+            answer_time = time.perf_counter() - start
 
-    return response.content, answer_time
+            answer = format_answer(response.content)
+
+            if not answer:
+                answer = "I couldn't find a readable answer. Please try rephrasing your question."
+
+            return answer, answer_time
+
+        except Exception as e:
+            error_message = str(e).upper()
+
+            # Retry temporary service-unavailable errors
+            if (
+                ("503" in error_message or "UNAVAILABLE" in error_message)
+                and attempt < 2
+            ):
+                time.sleep(2 ** (attempt + 1))
+                continue
+
+            raise
 
 
-#chatbot interface
+# load the chat model
+try:
+    llm = load_model()
+except Exception as e:
+    st.error(
+        "Could not initialize Gemini. Check your API key, "
+        "model availability, and configuration."
+    )
+    st.stop()
+
+
+# chatbot interface
 st.title("Document Q&A Chatbot")
 st.write("Upload a PDF and ask questions about it.")
 
 
-#checking whether a document is uploaded
+# checking whether a document is uploaded
 if "uploaded" not in st.session_state:
     st.session_state.uploaded = False
 
@@ -84,22 +180,27 @@ if "timings" not in st.session_state:
     st.session_state.timings = {}
 
 
-#first screen: upload PDF
+# first screen: upload PDF
 if not st.session_state.uploaded:
 
     file = st.file_uploader("Choose your PDF", type="pdf")
 
-    if file:
+    if file is not None:
+
         with st.spinner("Reading your document..."):
 
-            #saving PDF temporarily
-            with tempfile.NamedTemporaryFile(
-                delete=False, suffix=".pdf"
-            ) as temp_file:
-                temp_file.write(file.getvalue())
-                path = temp_file.name
+            path = None
 
             try:
+                # saving PDF temporarily
+                with tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix=".pdf"
+                ) as temp_file:
+                    temp_file.write(file.getvalue())
+                    path = temp_file.name
+
+                # processing the PDF
                 st.session_state.document_text = document_process(path)
 
                 if not st.session_state.document_text.strip():
@@ -114,20 +215,21 @@ if not st.session_state.uploaded:
                 st.error(f"Could not read the PDF: {e}")
 
             finally:
-                if os.path.exists(path):
+                if path and os.path.exists(path):
                     os.remove(path)
 
         if st.session_state.uploaded:
             st.rerun()
 
 
-#second screen: ask questions
+# second screen: ask questions
 else:
 
     st.success("Your document is ready!")
 
-    #showing previous questions and answers
-    for message in st.session_state.messages:
+    # showing previous questions and answers
+    for index, message in enumerate(st.session_state.messages):
+
         with st.chat_message(message["role"]):
             st.write(message["content"])
 
@@ -137,20 +239,19 @@ else:
                 )
 
                 if timing is not None:
-                    st.caption(
-                        f"Gemini response: {timing:.2f} seconds"
-                    )
+                    st.caption(f"Gemini response: {timing:.2f} seconds")
 
     query = st.chat_input("Ask a question about your PDF")
 
     if query:
 
-        #getting the answer
+        # saving the question
         st.session_state.messages.append(
             {"role": "user", "content": query}
         )
 
         with st.spinner("Finding the answer..."):
+
             try:
                 answer, answer_time = get_answer(
                     query,
@@ -160,12 +261,28 @@ else:
                 st.session_state.timings[query] = answer_time
 
             except Exception as e:
-                answer = (
-                    "Sorry, I could not generate an answer. "
-                    f"Please try again. Error: {e}"
-                )
+                error_message = str(e).upper()
 
-        #saving the conversation
+                if "429" in error_message or "RESOURCE_EXHAUSTED" in error_message:
+                    answer = (
+                        "The Gemini API quota has been reached. "
+                        "Please wait until your quota resets or check "
+                        "your usage at https://ai.dev/rate-limit."
+                    )
+
+                elif "503" in error_message or "UNAVAILABLE" in error_message:
+                    answer = (
+                        "Gemini is temporarily busy. Please wait a little "
+                        "and try again."
+                    )
+
+                else:
+                    answer = (
+                        "Sorry, I could not generate an answer. "
+                        f"Error: {e}"
+                    )
+
+        # saving the conversation
         st.session_state.messages.append(
             {
                 "role": "assistant",
@@ -177,10 +294,12 @@ else:
         st.rerun()
 
 
-    #upload a different PDF
+    # upload a different PDF
     if st.button("Upload another document"):
+
         st.session_state.uploaded = False
         st.session_state.messages = []
         st.session_state.document_text = ""
         st.session_state.timings = {}
+
         st.rerun()
