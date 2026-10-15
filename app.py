@@ -13,10 +13,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 # API key configuration
 try:
-    if (
-        not os.getenv("GOOGLE_API_KEY")
-        and "GOOGLE_API_KEY" in st.secrets
-    ):
+    if not os.getenv("GOOGLE_API_KEY") and "GOOGLE_API_KEY" in st.secrets:
         os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
 except Exception:
     pass
@@ -28,7 +25,7 @@ def load_model():
     return ChatGoogleGenerativeAI(
         model="gemini-3.8-flash",
         temperature=0,
-        max_output_tokens=300,
+        max_output_tokens=1000,
         timeout=60
     )
 
@@ -43,12 +40,12 @@ def document_process(path):
     # extracting text from the document
     document_text = "\n\n".join(
         doc.page_content for doc in docs
-    )
+    ).strip()
 
     return document_text
 
 
-# function to convert model output into readable text
+# function to format the model response as readable text
 def format_answer(content):
 
     if isinstance(content, str):
@@ -62,32 +59,30 @@ def format_answer(content):
                 parts.append(item)
 
             elif isinstance(item, dict):
-                # Extract text instead of showing the entire dictionary
                 text_value = item.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
 
-                if isinstance(text_value, str):
-                    parts.append(text_value)
-
-                elif item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
-
-            # Ignore non-text content such as signatures and SVG metadata
-
-        return "\n".join(part for part in parts if part).strip()
+        return "\n".join(parts).strip()
 
     if isinstance(content, dict):
         text_value = content.get("text")
-
         if isinstance(text_value, str):
             return text_value.strip()
 
-        return "The model returned structured data instead of a text answer."
-
-    return str(content).strip()
+    return ""
 
 
 # function to answer user's question
 def get_answer(query, document_text):
+
+    query = query.strip()
+
+    if not query:
+        return "Please enter a question about your document.", 0.0
+
+    if not document_text.strip():
+        return "No readable text was extracted from this PDF.", 0.0
 
     # Keep the request within a reasonable size
     max_chars = 40000
@@ -96,30 +91,30 @@ def get_answer(query, document_text):
     if len(document_text) > max_chars:
         relevant_text += (
             "\n\nOnly the beginning of the document is included. "
-            "If the answer is not present here, say that it was not found."
+            "The answer may not cover information outside this section."
         )
 
     prompt = f"""
 You are a helpful document question-answering assistant.
 
-Answer the user's question using only the document text below.
+Answer the user's question using the provided document text.
 
-Important rules:
-- Reply in normal, natural human language.
-- Do not return a Python dictionary, JSON, XML, SVG, signatures,
-  metadata, or other structured output.
-- If the question asks for a name, give the name directly.
-- If the answer is not present in the document, say so clearly.
-- Do not invent information.
-- Keep the answer concise and easy to understand.
+Instructions:
+- Use clear, natural, human-readable language.
+- Never return a dictionary, JSON, SVG, signature, or metadata.
+- For a summary requested in 10 lines, provide 10 numbered lines.
+- For key takeaways, provide a numbered list.
+- Answer questions directly and avoid unnecessary introductions.
+- If the answer is not present in the supplied text, say so.
+- Do not invent facts or pretend to have read text that was not provided.
 
-Document text:
+DOCUMENT:
 {relevant_text}
 
-User's question:
+USER QUESTION:
 {query}
 
-Your plain-language answer:
+ANSWER:
 """
 
     # Generate the answer using Gemini
@@ -132,7 +127,10 @@ Your plain-language answer:
             answer = format_answer(response.content)
 
             if not answer:
-                answer = "I couldn't find a readable answer. Please try rephrasing your question."
+                answer = (
+                    "Gemini returned an empty text response. "
+                    "Please try asking the question again."
+                )
 
             return answer, answer_time
 
@@ -153,10 +151,10 @@ Your plain-language answer:
 # load the chat model
 try:
     llm = load_model()
-except Exception as e:
+except Exception:
     st.error(
         "Could not initialize Gemini. Check your API key, "
-        "model availability, and configuration."
+        "model availability, and Streamlit Cloud Secrets."
     )
     st.stop()
 
@@ -200,15 +198,17 @@ if not st.session_state.uploaded:
                     temp_file.write(file.getvalue())
                     path = temp_file.name
 
-                # processing the PDF
-                st.session_state.document_text = document_process(path)
+                # processing the uploaded PDF
+                extracted_text = document_process(path)
 
-                if not st.session_state.document_text.strip():
+                if not extracted_text:
                     st.error(
                         "No readable text was found in this PDF. "
-                        "Please upload a text-based PDF."
+                        "It may be scanned or image-based. "
+                        "Please use a text-based PDF or add OCR support."
                     )
                 else:
+                    st.session_state.document_text = extracted_text
                     st.session_state.uploaded = True
 
             except Exception as e:
@@ -228,7 +228,7 @@ else:
     st.success("Your document is ready!")
 
     # showing previous questions and answers
-    for index, message in enumerate(st.session_state.messages):
+    for message in st.session_state.messages:
 
         with st.chat_message(message["role"]):
             st.write(message["content"])
@@ -239,11 +239,15 @@ else:
                 )
 
                 if timing is not None:
-                    st.caption(f"Gemini response: {timing:.2f} seconds")
+                    st.caption(
+                        f"Gemini response: {timing:.2f} seconds"
+                    )
 
     query = st.chat_input("Ask a question about your PDF")
 
-    if query:
+    if query and query.strip():
+
+        query = query.strip()
 
         # saving the question
         st.session_state.messages.append(
@@ -265,15 +269,15 @@ else:
 
                 if "429" in error_message or "RESOURCE_EXHAUSTED" in error_message:
                     answer = (
-                        "The Gemini API quota has been reached. "
-                        "Please wait until your quota resets or check "
-                        "your usage at https://ai.dev/rate-limit."
+                        "Your Gemini API quota has been reached. "
+                        "Wait until it resets or check your usage at "
+                        "https://ai.dev/rate-limit"
                     )
 
                 elif "503" in error_message or "UNAVAILABLE" in error_message:
                     answer = (
-                        "Gemini is temporarily busy. Please wait a little "
-                        "and try again."
+                        "Gemini is temporarily unavailable. "
+                        "Please wait a little and try again."
                     )
 
                 else:
